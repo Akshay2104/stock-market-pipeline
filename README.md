@@ -54,13 +54,19 @@ stock-market-pipeline/
 ├── docker-compose.yml          # Kafka + Zookeeper setup
 ├── requirement.txt             # Python dependencies
 ├── README.md
+├── DATA_STRUCTURE.md           # Delta Lake folder structure documentation
 ├── .gitignore
 ├── producers/
 │   └── stock_producer.py       # Kafka producer (mock + API support)
 ├── consumers/
 │   └── stock_consumer.py       # Simple consumer for verification
 ├── spark/
-│   └── streaming_job.py        # Spark Structured Streaming job
+│   └── streaming_job.py        # Spark Structured Streaming job (Bronze/Silver/Gold)
+├── data/                       # Local Delta Lake storage (gitignored)
+│   ├── bronze/                 # Raw Kafka messages
+│   ├── silver/                 # Cleaned & validated data
+│   ├── gold/                   # Windowed aggregations
+│   └── checkpoints/            # Spark streaming checkpoints
 ├── dbt/
 │   └── ...                     # dbt models for gold layer
 └── terraform/
@@ -137,6 +143,22 @@ spark-submit spark/streaming_job.py
 
 Reads from Kafka, applies transformations, and writes to Delta Lake in medallion architecture (Bronze → Silver → Gold).
 
+**What it does:**
+- **Bronze Layer**: Ingests raw Kafka messages with metadata (topic, partition, offset)
+- **Silver Layer**: Parses JSON, validates data (filters null/invalid prices)
+- **Gold Layer**: 1-minute windowed aggregations per ticker (avg, min, max, volume)
+
+The streaming job creates a `data/` directory with Delta Lake tables. See [DATA_STRUCTURE.md](DATA_STRUCTURE.md) for detailed documentation on the folder structure, schemas, and how to query the data.
+
+**Monitor the pipeline:**
+```bash
+# Check consumer group lag
+docker exec stock-market-pipeline-kafka-1 kafka-consumer-groups \
+  --bootstrap-server localhost:9092 \
+  --group spark-streaming-stock-prices \
+  --describe
+```
+
 ### 6. AWS Infrastructure
 
 ```bash
@@ -150,18 +172,34 @@ Provisions S3 buckets for Delta Lake storage and a Redshift cluster for the serv
 ## Key Concepts Demonstrated
 
 - **Kafka partitioning by key**: Messages are keyed by ticker symbol, ensuring all data for a given stock lands in the same partition and maintains ordering.
-- **Medallion architecture**: Bronze (raw ingestion) → Silver (cleaned, deduplicated) → Gold (aggregated, business-ready) layers in Delta Lake.
+- **Medallion architecture**: Bronze (raw ingestion) → Silver (cleaned, validated) → Gold (aggregated, business-ready) layers in Delta Lake.
+- **Delta Lake features**: ACID transactions, time travel, transaction logs, and Parquet columnar storage with Snappy compression.
 - **Exactly-once semantics**: Spark checkpointing + Delta Lake ACID writes ensure no data loss or duplication.
+- **Stateful streaming**: Windowed aggregations with watermarking for handling late-arriving data.
 - **Decoupled architecture**: Producer and consumer operate independently — Kafka durably stores messages until they are consumed.
 - **Infrastructure as Code**: Terraform manages all AWS resources for reproducibility and version control.
+
+## Data Layer Schemas
+
+### Bronze Layer
+Raw Kafka messages with metadata: `ticker_key`, `raw_value`, `topic`, `partition`, `offset`, `kafka_timestamp`, `ingestion_time`
+
+### Silver Layer
+Parsed and validated stock data: `ticker`, `price`, `high`, `low`, `open`, `volume`, `timestamp`, `processed_time`
+
+### Gold Layer
+1-minute windowed aggregations: `window`, `ticker`, `avg_price`, `min_price`, `max_price`, `total_volume`
+
+See [DATA_STRUCTURE.md](DATA_STRUCTURE.md) for complete documentation including query examples, maintenance operations, and troubleshooting.
 
 ## Status
 
 - [x] Kafka + Zookeeper infrastructure (Docker Compose)
 - [x] Stock data producer with mock data generator
-- [ ] Spark Structured Streaming consumer
-- [ ] Delta Lake medallion architecture (Bronze/Silver/Gold)
-- [ ] S3 integration
+- [x] Simple consumer for verification
+- [x] Spark Structured Streaming consumer
+- [x] Delta Lake medallion architecture (Bronze/Silver/Gold) - Local
+- [ ] S3 integration for Delta Lake
 - [ ] dbt models for analytics layer
 - [ ] Redshift serving layer
 - [ ] Terraform configuration (S3 + Redshift)
