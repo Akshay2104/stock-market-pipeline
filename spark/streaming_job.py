@@ -3,13 +3,21 @@ from pyspark.sql.functions import from_json, col, current_timestamp, avg, min, m
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
 from delta import configure_spark_with_delta_pip
 
-# Initialize Spark with Delta Lake
+S3_BUCKET = "s3a://stock-pipeline-data-lake-666a66c4"
+
+# Initialize Spark with Delta Lake and S3 support
 builder = SparkSession.builder \
     .appName("StockMarketPipeline") \
     .master("local[*]") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.1.0")
+    .config("spark.jars.packages",
+            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,"
+            "io.delta:delta-spark_2.12:3.1.0,"
+            "org.apache.hadoop:hadoop-aws:3.3.4") \
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+            "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
 
 spark = configure_spark_with_delta_pip(builder).getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
@@ -26,7 +34,6 @@ schema = StructType([
 ])
 
 # ============ BRONZE LAYER ============
-# Read raw data from Kafka - no transformations
 raw_stream = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "localhost:9092") \
@@ -34,20 +41,20 @@ raw_stream = spark.readStream \
     .option("startingOffsets", "earliest") \
     .load()
 
-# Parse the Kafka message value from bytes to JSON
 bronze_df = raw_stream \
-    .selectExpr("CAST(key AS STRING) as ticker_key", "CAST(value AS STRING) as raw_value", "topic", "partition", "offset", "timestamp as kafka_timestamp") \
+    .selectExpr("CAST(key AS STRING) as ticker_key",
+                "CAST(value AS STRING) as raw_value",
+                "topic", "partition", "offset",
+                "timestamp as kafka_timestamp") \
     .withColumn("ingestion_time", current_timestamp())
 
-# Write Bronze to Delta Lake
 bronze_query = bronze_df.writeStream \
     .format("delta") \
     .outputMode("append") \
-    .option("checkpointLocation", "data/checkpoints/bronze") \
-    .start("data/bronze/stock_prices")
+    .option("checkpointLocation", f"{S3_BUCKET}/checkpoints/bronze") \
+    .start(f"{S3_BUCKET}/bronze/stock_prices")
 
 # ============ SILVER LAYER ============
-# Parse JSON, apply schema, clean data
 silver_df = raw_stream \
     .selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), schema).alias("data")) \
@@ -56,15 +63,13 @@ silver_df = raw_stream \
     .filter(col("price").isNotNull()) \
     .filter(col("price") > 0)
 
-# Write Silver to Delta Lake
 silver_query = silver_df.writeStream \
     .format("delta") \
     .outputMode("append") \
-    .option("checkpointLocation", "data/checkpoints/silver") \
-    .start("data/silver/stock_prices")
+    .option("checkpointLocation", f"{S3_BUCKET}/checkpoints/silver") \
+    .start(f"{S3_BUCKET}/silver/stock_prices")
 
 # ============ GOLD LAYER ============
-# Aggregate: 1-minute window summaries per ticker
 gold_df = raw_stream \
     .selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), schema).alias("data")) \
@@ -82,15 +87,14 @@ gold_df = raw_stream \
         sum("volume").alias("total_volume")
     )
 
-# Write Gold to Delta Lake
 gold_query = gold_df.writeStream \
     .format("delta") \
     .outputMode("append") \
-    .option("checkpointLocation", "data/checkpoints/gold") \
-    .start("data/gold/stock_prices")
+    .option("checkpointLocation", f"{S3_BUCKET}/checkpoints/gold") \
+    .start(f"{S3_BUCKET}/gold/stock_prices")
 
-print("Pipeline running... Bronze, Silver, and Gold layers active.")
-print("Writing to data/bronze, data/silver, data/gold")
+print("Pipeline running... Writing to S3.")
+print(f"Bucket: {S3_BUCKET}")
+print("Bronze, Silver, and Gold layers active.")
 
-# Keep all streams running
 spark.streams.awaitAnyTermination()
