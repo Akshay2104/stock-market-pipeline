@@ -2,6 +2,10 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, current_timestamp, avg, min, max, sum, window
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
 from delta import configure_spark_with_delta_pip
+from pyspark.sql.functions import to_date
+from pyspark.sql.functions import from_json, col, current_timestamp, avg, min, max, sum, window, to_date
+
+
 
 S3_BUCKET = "s3a://stock-pipeline-data-lake-666a66c4"
 
@@ -46,11 +50,13 @@ bronze_df = raw_stream \
                 "CAST(value AS STRING) as raw_value",
                 "topic", "partition", "offset",
                 "timestamp as kafka_timestamp") \
-    .withColumn("ingestion_time", current_timestamp())
+    .withColumn("ingestion_time", current_timestamp()) \
+    .withColumn("trade_date", to_date(col("kafka_timestamp")))
 
 bronze_query = bronze_df.writeStream \
     .format("delta") \
     .outputMode("append") \
+    .partitionBy("trade_date") \
     .option("checkpointLocation", f"{S3_BUCKET}/checkpoints/bronze") \
     .start(f"{S3_BUCKET}/bronze/stock_prices")
 
@@ -60,12 +66,14 @@ silver_df = raw_stream \
     .select(from_json(col("json_str"), schema).alias("data")) \
     .select("data.*") \
     .withColumn("processed_time", current_timestamp()) \
+    .withColumn("trade_date", to_date(col("timestamp"))) \
     .filter(col("price").isNotNull()) \
     .filter(col("price") > 0)
 
 silver_query = silver_df.writeStream \
     .format("delta") \
     .outputMode("append") \
+    .partitionBy("trade_date") \
     .option("checkpointLocation", f"{S3_BUCKET}/checkpoints/silver") \
     .start(f"{S3_BUCKET}/silver/stock_prices")
 
