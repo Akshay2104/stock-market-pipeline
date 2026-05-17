@@ -1,17 +1,16 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, current_timestamp, avg, min, max, sum, window
+from pyspark.sql.functions import from_json, col, current_timestamp, avg, min, max, sum, window, to_date, round, when, lit
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
 from delta import configure_spark_with_delta_pip
-from pyspark.sql.functions import to_date
-from pyspark.sql.functions import from_json, col, current_timestamp, avg, min, max, sum, window, to_date, round, when, lag
-from pyspark.sql.window import Window
 
 S3_BUCKET = "s3a://stock-pipeline-data-lake-666a66c4"
 
-# Initialize Spark with Delta Lake and S3 support
 builder = SparkSession.builder \
     .appName("StockMarketPipeline") \
-    .master("local[*]") \
+    .master("local[2]") \
+    .config("spark.driver.memory", "4g") \
+    .config("spark.sql.shuffle.partitions", "2") \
+    .config("spark.default.parallelism", "2") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
     .config("spark.jars.packages",
@@ -25,7 +24,6 @@ builder = SparkSession.builder \
 spark = configure_spark_with_delta_pip(builder).getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
 
-# Define schema for our stock data
 schema = StructType([
     StructField("ticker", StringType(), True),
     StructField("price", DoubleType(), True),
@@ -41,7 +39,7 @@ raw_stream = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "localhost:9092") \
     .option("subscribe", "stock_prices") \
-    .option("startingOffsets", "earliest") \
+    .option("startingOffsets", "latest") \
     .load()
 
 bronze_df = raw_stream \
@@ -74,10 +72,10 @@ silver_query = silver_df.writeStream \
     .outputMode("append") \
     .partitionBy("trade_date") \
     .option("checkpointLocation", f"{S3_BUCKET}/checkpoints/silver") \
+    .option("mergeSchema", "true") \
     .start(f"{S3_BUCKET}/silver/stock_prices")
 
 # ============ GOLD LAYER ============
-# Parse and prepare the stream for aggregation
 parsed_stream = raw_stream \
     .selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), schema).alias("data")) \
@@ -85,7 +83,6 @@ parsed_stream = raw_stream \
     .withColumn("event_time", col("timestamp").cast(TimestampType())) \
     .withWatermark("event_time", "2 minutes")
 
-# Step 1 — Aggregate into 1-minute windows per ticker
 gold_df = parsed_stream \
     .groupBy(
         window(col("event_time"), "1 minute"),
@@ -98,47 +95,39 @@ gold_df = parsed_stream \
         sum("volume").alias("total_volume")
     )
 
-# Step 2 — Calculate volume baseline using last 5 windows per ticker
-# Window spec: look back at previous 5 rows for the same ticker, ordered by window start time
-ticker_window = Window \
-    .partitionBy("ticker") \
-    .orderBy("window") \
-    .rowsBetween(-5, -1)  # look at previous 5 rows, not including current row
+volume_thresholds = {
+    'AAPL':  3000000,
+    'GOOGL': 2000000,
+    'MSFT':  3000000,
+    'AMZN':  2500000,
+    'TSLA':  4000000
+}
 
-# Add baseline average volume column
-gold_with_baseline = gold_df \
+gold_with_anomaly = gold_df \
     .withColumn(
-        "avg_volume_baseline",
-        round(avg("total_volume").over(ticker_window), 0)
-    )
-
-# Step 3 — Flag anomalies where volume exceeds 2x baseline
-gold_with_anomaly = gold_with_baseline \
-    .withColumn(
-        "volume_ratio",
-        round(col("total_volume") / col("avg_volume_baseline"), 2)
+        "volume_threshold",
+        when(col("ticker") == "AAPL", volume_thresholds['AAPL'])
+        .when(col("ticker") == "GOOGL", volume_thresholds['GOOGL'])
+        .when(col("ticker") == "MSFT", volume_thresholds['MSFT'])
+        .when(col("ticker") == "AMZN", volume_thresholds['AMZN'])
+        .when(col("ticker") == "TSLA", volume_thresholds['TSLA'])
+        .otherwise(1000000)
     ) \
-    .withColumn(
-        "is_anomaly",
-        when(
-            col("avg_volume_baseline").isNull(), False  # not enough history yet
-        ).when(
-            col("total_volume") > col("avg_volume_baseline") * 2, True
-        ).otherwise(False)
-    ) \
+    .withColumn("is_anomaly", col("total_volume") > col("volume_threshold")) \
     .withColumn(
         "anomaly_reason",
-        when(
-            col("is_anomaly") == True,
-            # Builds a readable reason string e.g. "Volume 3.5x above 5-window baseline"
-            col("volume_ratio").cast("string")
+        when(col("is_anomaly") == True,
+             col("total_volume").cast("string")
         ).otherwise(None)
-    )
+    ) \
+    .drop("volume_threshold")
 
-# Write Gold to S3 Delta Lake
 gold_query = gold_with_anomaly.writeStream \
     .format("delta") \
     .outputMode("append") \
     .option("checkpointLocation", f"{S3_BUCKET}/checkpoints/gold_v2") \
     .option("mergeSchema", "true") \
     .start(f"{S3_BUCKET}/gold/stock_prices")
+
+print("Pipeline running...")
+spark.streams.awaitAnyTermination()
